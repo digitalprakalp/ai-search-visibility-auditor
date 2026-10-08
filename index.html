@@ -417,11 +417,22 @@ document
             console.log("AIVA Audit Result:", result);
 
             alert(
-                "Audit completed!\n\n" +
-                "AI Search Visibility Score: " +
-                result.score +
-                "/100"
-            );
+    "Audit completed!\n\n" +
+    "Pages analyzed: " +
+    result.website.pages_analyzed +
+    "\nTotal words: " +
+    result.website.total_words +
+    "\nQuestions found: " +
+    result.website.total_questions +
+    "\nStructured data blocks: " +
+    result.website.total_schemas +
+    "\n\nRobots.txt: " +
+    (result.technical.robots_txt.available ? "Found" : "Not found") +
+    "\nSitemap.xml: " +
+    (result.technical.sitemap_xml.available ? "Found" : "Not found") +
+    "\nllms.txt: " +
+    (result.technical.llms_txt.available ? "Found" : "Not found")
+);
 
         } catch (error) {
 
