@@ -3,1100 +3,429 @@ from flask_cors import CORS
 import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
-from datetime import datetime
 import re
-import json
+from collections import deque
+from datetime import datetime
 
 app = Flask(__name__)
 CORS(app)
 
-USER_AGENT = "AIVA-AI-Search-Auditor/2.0"
+HEADERS = {
+    "User-Agent": "AIVA-AI-Search-Visibility-Auditor/1.0"
+}
+
+MAX_PAGES = 15
+REQUEST_TIMEOUT = 12
 
 
-# ---------------------------------------------------------
-# BASIC HELPERS
-# ---------------------------------------------------------
-
-def get_url(url):
-    headers = {
-        "User-Agent": USER_AGENT
-    }
-
-    return requests.get(
-        url,
-        headers=headers,
-        timeout=15,
-        allow_redirects=True
-    )
-
-
-def valid_url(url):
+def normalize_url(url):
     parsed = urlparse(url)
 
-    return (
-        parsed.scheme in ["http", "https"]
-        and bool(parsed.netloc)
-    )
+    scheme = parsed.scheme or "https"
+    netloc = parsed.netloc
+
+    path = parsed.path or "/"
+
+    if path != "/" and path.endswith("/"):
+        path = path[:-1]
+
+    return f"{scheme}://{netloc}{path}"
 
 
-def absolute_url(base, value):
-    return urljoin(base, value)
+def same_domain(url1, url2):
+    return urlparse(url1).netloc.lower() == urlparse(url2).netloc.lower()
 
 
-# ---------------------------------------------------------
-# FILE CHECKS
-# ---------------------------------------------------------
-
-def check_file(base_url, filename):
-
-    parsed = urlparse(base_url)
-
-    file_url = (
-        f"{parsed.scheme}://{parsed.netloc}/{filename}"
-    )
-
+def fetch_page(url):
     try:
-
         response = requests.get(
-            file_url,
-            headers={"User-Agent": USER_AGENT},
-            timeout=10
+            url,
+            headers=HEADERS,
+            timeout=REQUEST_TIMEOUT,
+            allow_redirects=True
         )
 
+        content_type = response.headers.get("Content-Type", "")
+
+        if response.status_code >= 400:
+            return None
+
+        if "text/html" not in content_type.lower():
+            return None
+
         return {
-            "exists": response.status_code == 200,
-            "url": file_url,
+            "url": response.url,
             "status_code": response.status_code,
-            "content": response.text[:20000]
-            if response.status_code == 200
-            else ""
+            "html": response.text,
+            "content_type": content_type
         }
 
     except Exception:
-
-        return {
-            "exists": False,
-            "url": file_url,
-            "status_code": 0,
-            "content": ""
-        }
+        return None
 
 
-# ---------------------------------------------------------
-# QUESTION DETECTION
-# ---------------------------------------------------------
+def extract_page_data(url, html):
+    soup = BeautifulSoup(html, "html.parser")
 
-def detect_questions(soup):
+    # Remove elements that don't represent main readable content
+    for element in soup([
+        "script",
+        "style",
+        "noscript",
+        "svg",
+        "iframe"
+    ]):
+        element.decompose()
 
+    title = ""
+    if soup.title:
+        title = soup.title.get_text(" ", strip=True)
+
+    meta_description = ""
+    meta = soup.find("meta", attrs={"name": re.compile("^description$", re.I)})
+
+    if meta:
+        meta_description = meta.get("content", "").strip()
+
+    headings = {
+        "h1": [x.get_text(" ", strip=True) for x in soup.find_all("h1")],
+        "h2": [x.get_text(" ", strip=True) for x in soup.find_all("h2")],
+        "h3": [x.get_text(" ", strip=True) for x in soup.find_all("h3")]
+    }
+
+    paragraphs = [
+        x.get_text(" ", strip=True)
+        for x in soup.find_all("p")
+        if x.get_text(" ", strip=True)
+    ]
+
+    text = soup.get_text(" ", strip=True)
+
+    words = re.findall(r"\b\w+\b", text)
+
+    # Questions from headings and text
     questions = []
 
-    # Question headings
-    for heading in soup.find_all(
-        ["h2", "h3", "h4"]
-    ):
+    for heading_level in ["h1", "h2", "h3"]:
+        for heading in headings[heading_level]:
+            if "?" in heading:
+                questions.append(heading)
 
-        text = heading.get_text(
-            " ",
-            strip=True
-        )
+    question_sentences = re.findall(
+        r"[^.!?]*\?",
+        text
+    )
 
-        if "?" in text:
-            questions.append(text)
+    for question in question_sentences:
+        question = re.sub(r"\s+", " ", question).strip()
 
-    # FAQ-style questions
-    for element in soup.find_all(
-        ["summary", "dt"]
-    ):
+        if len(question) > 15 and len(question) < 300:
+            questions.append(question)
 
-        text = element.get_text(
-            " ",
-            strip=True
-        )
+    # Remove duplicate questions
+    questions = list(dict.fromkeys(questions))
 
-        if "?" in text:
-            questions.append(text)
+    # Links
+    links = []
 
-    # Remove duplicates
-    unique = []
+    for a in soup.find_all("a", href=True):
+        href = a.get("href")
 
-    for question in questions:
+        if href.startswith("#"):
+            continue
 
-        if question not in unique:
-            unique.append(question)
+        absolute = urljoin(url, href)
 
-    return unique[:50]
+        parsed = urlparse(absolute)
 
+        if parsed.scheme in ["http", "https"]:
+            clean = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
 
-# ---------------------------------------------------------
-# STRUCTURED DATA
-# ---------------------------------------------------------
+            if same_domain(clean, url):
+                links.append(clean)
 
-def analyze_schema(soup):
+    links = list(dict.fromkeys(links))
 
+    # Canonical
+    canonical = None
+
+    canonical_tag = soup.find(
+        "link",
+        attrs={"rel": lambda value: value and "canonical" in value}
+    )
+
+    if canonical_tag:
+        canonical = canonical_tag.get("href")
+
+    # Structured data
     schemas = []
 
     for script in soup.find_all(
         "script",
         attrs={"type": "application/ld+json"}
     ):
+        if script.string:
+            schemas.append(script.string.strip())
 
-        try:
+    # Images
+    images = len(soup.find_all("img"))
 
-            data = json.loads(
-                script.string or script.get_text()
-            )
+    images_without_alt = len([
+        img for img in soup.find_all("img")
+        if not img.get("alt")
+    ])
 
-            if isinstance(data, list):
-                schemas.extend(data)
+    # Lists
+    list_count = len(soup.find_all(["ul", "ol"]))
 
-            else:
-                schemas.append(data)
+    # Tables
+    table_count = len(soup.find_all("table"))
 
-        except Exception:
+    return {
+        "url": url,
+        "title": title,
+        "meta_description": meta_description,
+
+        "headings": headings,
+
+        "paragraphs": paragraphs,
+        "text": text[:50000],
+
+        "word_count": len(words),
+
+        "questions": questions,
+
+        "links": links,
+
+        "canonical": canonical,
+
+        "schemas": schemas,
+
+        "images": images,
+        "images_without_alt": images_without_alt,
+
+        "lists": list_count,
+        "tables": table_count
+    }
+
+
+def crawl_website(start_url):
+    start_url = normalize_url(start_url)
+
+    domain = urlparse(start_url).netloc
+
+    queue = deque([start_url])
+    visited = set()
+
+    pages = []
+
+    while queue and len(pages) < MAX_PAGES:
+
+        current_url = queue.popleft()
+
+        if current_url in visited:
             continue
 
-    schema_types = []
+        visited.add(current_url)
 
-    def extract_type(item):
+        if not same_domain(current_url, start_url):
+            continue
 
-        if isinstance(item, dict):
+        result = fetch_page(current_url)
 
-            item_type = item.get("@type")
+        if not result:
+            continue
 
-            if isinstance(item_type, list):
-                schema_types.extend(item_type)
-
-            elif item_type:
-                schema_types.append(
-                    str(item_type)
-                )
-
-            for value in item.values():
-
-                if isinstance(value, dict):
-                    extract_type(value)
-
-                elif isinstance(value, list):
-
-                    for child in value:
-                        extract_type(child)
-
-    for schema in schemas:
-        extract_type(schema)
-
-    return {
-        "count": len(schemas),
-        "types": sorted(
-            list(set(schema_types))
-        )
-    }
-
-
-# ---------------------------------------------------------
-# ENTITY SIGNALS
-# ---------------------------------------------------------
-
-def analyze_entities(soup, schema):
-
-    text = soup.get_text(
-        " ",
-        strip=True
-    )
-
-    links = []
-
-    for link in soup.find_all(
-        "a",
-        href=True
-    ):
-
-        href = link.get("href", "")
-        label = link.get_text(
-            " ",
-            strip=True
+        page_data = extract_page_data(
+            current_url,
+            result["html"]
         )
 
-        links.append({
-            "label": label,
-            "href": href
-        })
+        pages.append(page_data)
 
-    has_about = any(
-        "about" in (
-            item["href"] +
-            item["label"]
-        ).lower()
-        for item in links
-    )
+        # Add internal links to crawler queue
+        for link in page_data["links"]:
 
-    has_contact = any(
-        "contact" in (
-            item["href"] +
-            item["label"]
-        ).lower()
-        for item in links
-    )
+            if link in visited:
+                continue
 
-    organization_schema = (
-        "Organization" in schema["types"]
-        or "LocalBusiness" in schema["types"]
-    )
+            if not same_domain(link, start_url):
+                continue
 
-    person_schema = "Person" in schema["types"]
+            parsed = urlparse(link)
 
-    logo_present = bool(
-        soup.find(
-            "img",
-            alt=re.compile(
-                r"logo",
-                re.I
-            )
+            # Avoid obvious non-page resources
+            excluded_extensions = [
+                ".jpg",
+                ".jpeg",
+                ".png",
+                ".gif",
+                ".svg",
+                ".webp",
+                ".pdf",
+                ".zip",
+                ".mp4",
+                ".mp3"
+            ]
+
+            if any(
+                parsed.path.lower().endswith(ext)
+                for ext in excluded_extensions
+            ):
+                continue
+
+            queue.append(link)
+
+    return pages
+
+
+def check_resource(base_url, path):
+    url = urljoin(base_url, path)
+
+    try:
+        response = requests.get(
+            url,
+            headers=HEADERS,
+            timeout=REQUEST_TIMEOUT,
+            allow_redirects=True
         )
-    )
-
-    return {
-        "organization_schema": organization_schema,
-        "person_schema": person_schema,
-        "about_page_signal": has_about,
-        "contact_page_signal": has_contact,
-        "logo_signal": logo_present
-    }
-
-
-# ---------------------------------------------------------
-# CONTENT QUALITY SIGNALS
-# ---------------------------------------------------------
-
-def analyze_content(soup, text):
-
-    words = re.findall(
-        r"\b[\w'-]+\b",
-        text
-    )
-
-    word_count = len(words)
-
-    h1 = soup.find_all("h1")
-    h2 = soup.find_all("h2")
-    h3 = soup.find_all("h3")
-
-    paragraphs = soup.find_all("p")
-
-    lists = soup.find_all(
-        ["ul", "ol"]
-    )
-
-    images = soup.find_all("img")
-
-    images_with_alt = [
-        img for img in images
-        if img.get("alt", "").strip()
-    ]
-
-    links = soup.find_all(
-        "a",
-        href=True
-    )
-
-    external_links = []
-
-    for link in links:
-
-        href = link.get("href", "")
-
-        if href.startswith("http"):
-            external_links.append(href)
-
-    # Signals of evidence/original information
-    statistics = len(
-        re.findall(
-            r"\b\d+(?:\.\d+)?%\b",
-            text
-        )
-    )
-
-    citation_signals = len(
-        re.findall(
-            r"\baccording to\b|\bstudy\b|\bresearch\b|\bsource\b|\breport\b",
-            text,
-            re.I
-        )
-    )
-
-    first_hand_signals = len(
-        re.findall(
-            r"\bour experience\b|\bour data\b|\bwe found\b|\bour research\b|\bcase study\b",
-            text,
-            re.I
-        )
-    )
-
-    generic_signals = len(
-        re.findall(
-            r"\bbest solution\b|\btop solution\b|\bultimate guide\b|\bworld[- ]class\b|\bleading solution\b",
-            text,
-            re.I
-        )
-    )
-
-    return {
-        "word_count": word_count,
-        "h1_count": len(h1),
-        "h2_count": len(h2),
-        "h3_count": len(h3),
-        "paragraph_count": len(paragraphs),
-        "list_count": len(lists),
-        "image_count": len(images),
-        "images_with_alt": len(images_with_alt),
-        "internal_link_count": len(links),
-        "external_link_count": len(external_links),
-        "statistics": statistics,
-        "citation_signals": citation_signals,
-        "first_hand_signals": first_hand_signals,
-        "generic_signals": generic_signals
-    }
-
-
-# ---------------------------------------------------------
-# FRESHNESS
-# ---------------------------------------------------------
-
-def analyze_freshness(soup):
-
-    dates = []
-
-    for tag in soup.find_all(
-        ["time", "meta"]
-    ):
-
-        value = (
-            tag.get("datetime")
-            or tag.get("content")
-        )
-
-        if value:
-            dates.append(value)
-
-    detected_date = None
-
-    for value in dates:
-
-        match = re.search(
-            r"(20\d{2})[-/](\d{1,2})[-/](\d{1,2})",
-            value
-        )
-
-        if match:
-
-            try:
-
-                detected_date = datetime(
-                    int(match.group(1)),
-                    int(match.group(2)),
-                    int(match.group(3))
-                )
-
-                break
-
-            except Exception:
-                pass
-
-    if not detected_date:
 
         return {
-            "date_found": False,
-            "age_days": None
+            "url": url,
+            "status_code": response.status_code,
+            "available": response.status_code == 200,
+            "content_length": len(response.text),
+            "content": response.text[:30000]
         }
 
-    age_days = (
-        datetime.utcnow() -
-        detected_date
-    ).days
-
-    return {
-        "date_found": True,
-        "age_days": age_days
-    }
-
-
-# ---------------------------------------------------------
-# MAIN PAGE ANALYSIS
-# ---------------------------------------------------------
-
-def analyze_page(url):
-
-    response = get_url(url)
-
-    soup = BeautifulSoup(
-        response.text,
-        "html.parser"
-    )
-
-    title = (
-        soup.title.get_text(
-            " ",
-            strip=True
-        )
-        if soup.title
-        else ""
-    )
-
-    meta = soup.find(
-        "meta",
-        attrs={
-            "name": re.compile(
-                "^description$",
-                re.I
-            )
+    except Exception as e:
+        return {
+            "url": url,
+            "status_code": None,
+            "available": False,
+            "content_length": 0,
+            "content": "",
+            "error": str(e)
         }
+
+
+def collect_technical_data(start_url):
+
+    robots = check_resource(
+        start_url,
+        "/robots.txt"
     )
 
-    meta_description = (
-        meta.get("content", "").strip()
-        if meta
-        else ""
+    sitemap = check_resource(
+        start_url,
+        "/sitemap.xml"
     )
 
-    h1_tags = soup.find_all("h1")
-
-    canonical = soup.find(
-        "link",
-        rel=lambda value:
-        value and "canonical" in value
+    llms = check_resource(
+        start_url,
+        "/llms.txt"
     )
 
-    canonical_url = (
-        canonical.get("href", "").strip()
-        if canonical
-        else ""
-    )
-
-    schema = analyze_schema(soup)
-
-    questions = detect_questions(soup)
-
-    for tag in soup(
-        ["script", "style", "noscript"]
-    ):
-        tag.decompose()
-
-    text = soup.get_text(
-        " ",
-        strip=True
-    )
-
-    content = analyze_content(
-        soup,
-        text
-    )
-
-    entities = analyze_entities(
-        soup,
-        schema
-    )
-
-    freshness = analyze_freshness(
-        soup
-    )
-
-    # Internal links
-    parsed_base = urlparse(
-        response.url
-    )
-
-    internal_links = []
-
-    for link in soup.find_all(
-        "a",
-        href=True
-    ):
-
-        href = link.get(
-            "href",
-            ""
-        ).strip()
-
-        if not href:
-            continue
-
-        absolute = absolute_url(
-            response.url,
-            href
-        )
-
-        parsed_link = urlparse(
-            absolute
-        )
-
-        if (
-            parsed_link.netloc
-            == parsed_base.netloc
-        ):
-            internal_links.append(
-                absolute
-            )
-
-    return {
-
-        "status_code":
-            response.status_code,
-
-        "final_url":
-            response.url,
-
-        "https":
-            response.url.startswith(
-                "https://"
-            ),
-
-        "title":
-            title,
-
-        "title_length":
-            len(title),
-
-        "meta_description":
-            meta_description,
-
-        "meta_description_length":
-            len(meta_description),
-
-        "h1":
-            h1_tags[0].get_text(
-                " ",
-                strip=True
-            )
-            if h1_tags
-            else "",
-
-        "h1_count":
-            len(h1_tags),
-
-        "canonical":
-            canonical_url,
-
-        "schema":
-            schema,
-
-        "questions":
-            questions,
-
-        "question_count":
-            len(questions),
-
-        "content":
-            content,
-
-        "entities":
-            entities,
-
-        "freshness":
-            freshness,
-
-        "internal_links":
-            len(internal_links)
-    }
-
-
-# ---------------------------------------------------------
-# SCORING
-# ---------------------------------------------------------
-
-def calculate_scores(data):
-
-    # ------------------------------------
-    # 1. TECHNICAL ACCESSIBILITY / 10
-    # ------------------------------------
-
-    technical = 0
-
-    if data["https"]:
-        technical += 2
-
-    if data["status_code"] == 200:
-        technical += 2
-
-    if data["robots"]["exists"]:
-        technical += 2
-
-    if data["sitemap"]["exists"]:
-        technical += 2
-
-    if data["canonical"]:
-        technical += 1
-
-    if data["content"]["word_count"] > 100:
-        technical += 1
-
-    technical = min(
-        technical,
-        10
-    )
-
-    # ------------------------------------
-    # 2. HELPFUL & ORIGINAL CONTENT / 18
-    # ------------------------------------
-
-    content_score = 0
-
-    words = data["content"]["word_count"]
-
-    if words >= 1500:
-        content_score += 5
-
-    elif words >= 900:
-        content_score += 4
-
-    elif words >= 500:
-        content_score += 3
-
-    elif words >= 250:
-        content_score += 1
-
-    if data["content"]["h2_count"] >= 3:
-        content_score += 2
-
-    if data["content"]["h3_count"] >= 2:
-        content_score += 1
-
-    if data["content"]["list_count"] >= 2:
-        content_score += 1
-
-    if data["content"]["statistics"] >= 2:
-        content_score += 2
-
-    if data["content"]["citation_signals"] >= 2:
-        content_score += 2
-
-    if data["content"]["first_hand_signals"] >= 1:
-        content_score += 3
-
-    # Generic marketing language reduces differentiation
-    if data["content"]["generic_signals"] >= 5:
-        content_score -= 2
-
-    content_score = max(
-        0,
-        min(content_score, 18)
-    )
-
-    # ------------------------------------
-    # 3. QUESTION & INTENT COVERAGE / 12
-    # ------------------------------------
-
-    question_score = 0
-
-    question_count = data[
-        "question_count"
-    ]
-
-    if question_count >= 8:
-        question_score = 12
-
-    elif question_count >= 5:
-        question_score = 9
-
-    elif question_count >= 3:
-        question_score = 6
-
-    elif question_count >= 1:
-        question_score = 3
-
-    # ------------------------------------
-    # 4. ENTITY UNDERSTANDING / 12
-    # ------------------------------------
-
-    entity_score = 0
-
-    entities = data["entities"]
-
-    if entities["organization_schema"]:
-        entity_score += 3
-
-    if entities["person_schema"]:
-        entity_score += 1
-
-    if entities["about_page_signal"]:
-        entity_score += 2
-
-    if entities["contact_page_signal"]:
-        entity_score += 2
-
-    if entities["logo_signal"]:
-        entity_score += 1
-
-    if data["title"]:
-        entity_score += 1
-
-    if data["h1"]:
-        entity_score += 1
-
-    if data["meta_description"]:
-        entity_score += 1
-
-    entity_score = min(
-        entity_score,
-        12
-    )
-
-    # ------------------------------------
-    # 5. TOPICAL COVERAGE / 12
-    # ------------------------------------
-
-    topical_score = 0
-
-    h2 = data["content"]["h2_count"]
-    h3 = data["content"]["h3_count"]
-
-    if h2 >= 8:
-        topical_score += 6
-
-    elif h2 >= 5:
-        topical_score += 4
-
-    elif h2 >= 3:
-        topical_score += 2
-
-    if h3 >= 6:
-        topical_score += 4
-
-    elif h3 >= 3:
-        topical_score += 2
-
-    if data["question_count"] >= 3:
-        topical_score += 2
-
-    topical_score = min(
-        topical_score,
-        12
-    )
-
-    # ------------------------------------
-    # 6. CITATION & EVIDENCE / 10
-    # ------------------------------------
-
-    citation_score = 0
-
-    if data["content"]["statistics"] >= 1:
-        citation_score += 2
-
-    if data["content"]["citation_signals"] >= 1:
-        citation_score += 2
-
-    if data["content"]["external_link_count"] >= 3:
-        citation_score += 2
-
-    if data["content"]["first_hand_signals"] >= 1:
-        citation_score += 3
-
-    if data["freshness"]["date_found"]:
-        citation_score += 1
-
-    citation_score = min(
-        citation_score,
-        10
-    )
-
-    # ------------------------------------
-    # 7. STRUCTURED DATA / 8
-    # ------------------------------------
-
-    schema_score = 0
-
-    schema_types = data[
-        "schema"
-    ]["types"]
-
-    if len(schema_types) >= 1:
-        schema_score += 2
-
-    if "Organization" in schema_types:
-        schema_score += 2
-
-    if "Article" in schema_types:
-        schema_score += 1
-
-    if "BreadcrumbList" in schema_types:
-        schema_score += 1
-
-    if "FAQPage" in schema_types:
-        schema_score += 1
-
-    if "WebSite" in schema_types:
-        schema_score += 1
-
-    schema_score = min(
-        schema_score,
-        8
-    )
-
-    # ------------------------------------
-    # 8. FRESHNESS / 7
-    # ------------------------------------
-
-    freshness_score = 0
-
-    freshness = data[
-        "freshness"
-    ]
-
-    if freshness["date_found"]:
-
-        age = freshness["age_days"]
-
-        if age <= 90:
-            freshness_score = 7
-
-        elif age <= 180:
-            freshness_score = 5
-
-        elif age <= 365:
-            freshness_score = 3
-
-        else:
-            freshness_score = 1
-
-    else:
-
-        freshness_score = 2
-
-    # ------------------------------------
-    # 9. INTERNAL DISCOVERABILITY / 6
-    # ------------------------------------
-
-    architecture_score = 0
-
-    links = data["internal_links"]
-
-    if links >= 20:
-        architecture_score = 6
-
-    elif links >= 10:
-        architecture_score = 5
-
-    elif links >= 5:
-        architecture_score = 3
-
-    elif links >= 2:
-        architecture_score = 1
-
-    # ------------------------------------
-    # 10. LLM ACCESSIBILITY / 5
-    # ------------------------------------
-
-    llm_score = 0
-
-    if data["llms"]["exists"]:
-        llm_score += 2
-
-    if data["llms"]["content"]:
-        llm_score += 1
-
-    if data["robots"]["exists"]:
-        llm_score += 1
-
-    if data["sitemap"]["exists"]:
-        llm_score += 1
-
-    llm_score = min(
-        llm_score,
-        5
-    )
-
-    # ------------------------------------
-    # TOTAL
-    # ------------------------------------
-
-    total = (
-        technical
-        + content_score
-        + question_score
-        + entity_score
-        + topical_score
-        + citation_score
-        + schema_score
-        + freshness_score
-        + architecture_score
-        + llm_score
-    )
-
-    # Prevent unrealistically high scores
-    # until deeper AI analysis is available.
-
-    if entity_score < 6:
-        total = min(total, 84)
-
-    if content_score < 10:
-        total = min(total, 84)
-
-    if question_score < 6:
-        total = min(total, 89)
-
-    if citation_score < 5:
-        total = min(total, 89)
-
-    total = min(
-        total,
-        89
+    llms_full = check_resource(
+        start_url,
+        "/llms-full.txt"
     )
 
     return {
-
-        "total": total,
-
-        "technical_accessibility":
-            technical,
-
-        "helpful_original_content":
-            content_score,
-
-        "question_intent_coverage":
-            question_score,
-
-        "entity_understanding":
-            entity_score,
-
-        "topical_coverage":
-            topical_score,
-
-        "citation_evidence_readiness":
-            citation_score,
-
-        "structured_data":
-            schema_score,
-
-        "freshness":
-            freshness_score,
-
-        "internal_discoverability":
-            architecture_score,
-
-        "llm_accessibility":
-            llm_score
+        "robots_txt": robots,
+        "sitemap_xml": sitemap,
+        "llms_txt": llms,
+        "llms_full_txt": llms_full
     }
 
-
-# ---------------------------------------------------------
-# API
-# ---------------------------------------------------------
 
 @app.route("/")
 def home():
 
     return jsonify({
-
-        "name":
-            "AIVA",
-
-        "message":
-            "AI Search Visibility Auditor API",
-
-        "version":
-            "2.0",
-
-        "status":
-            "running"
+        "message": "AI Search Visibility Auditor API",
+        "name": "AIVA",
+        "status": "running"
     })
 
 
-@app.route(
-    "/audit",
-    methods=["POST"]
-)
+@app.route("/audit", methods=["POST"])
 def audit():
 
-    body = request.get_json(
-        silent=True
-    ) or {}
+    data = request.get_json(silent=True) or {}
 
-    url = body.get(
-        "url",
-        ""
-    ).strip()
+    url = data.get("url")
 
     if not url:
-
         return jsonify({
-            "error":
-                "Website URL is required"
+            "error": "URL is required"
         }), 400
 
-    if not url.startswith(
-        ("http://", "https://")
-    ):
-
+    if not url.startswith(("http://", "https://")):
         url = "https://" + url
-
-    if not valid_url(url):
-
-        return jsonify({
-            "error":
-                "Invalid website URL"
-        }), 400
 
     try:
 
-        data = analyze_page(url)
-
         parsed = urlparse(url)
 
-        data["robots"] = check_file(
-            url,
-            "robots.txt"
+        if not parsed.netloc:
+            return jsonify({
+                "error": "Invalid URL"
+            }), 400
+
+        pages = crawl_website(url)
+
+        technical = collect_technical_data(url)
+
+        total_words = sum(
+            page["word_count"]
+            for page in pages
         )
 
-        data["sitemap"] = check_file(
-            url,
-            "sitemap.xml"
+        total_questions = sum(
+            len(page["questions"])
+            for page in pages
         )
 
-        data["llms"] = check_file(
-            url,
-            "llms.txt"
-        )
-
-        scores = calculate_scores(
-            data
+        total_schemas = sum(
+            len(page["schemas"])
+            for page in pages
         )
 
         return jsonify({
 
-            "success":
-                True,
+            "status": "success",
 
-            "url":
-                url,
+            "website": {
+                "url": url,
+                "domain": parsed.netloc,
+                "pages_analyzed": len(pages),
+                "total_words": total_words,
+                "total_questions": total_questions,
+                "total_schemas": total_schemas
+            },
 
-            "score":
-                scores["total"],
+            "crawl": {
+                "pages": pages
+            },
 
-            "score_breakdown":
-                scores,
+            "technical": technical,
 
-            "analysis":
-                data
+            "crawl_timestamp": datetime.utcnow().isoformat() + "Z"
 
         })
 
-    except requests.exceptions.RequestException:
+    except Exception as e:
 
         return jsonify({
-            "error":
-                "Unable to access the website"
-        }), 502
-
-    except Exception as error:
-
-        return jsonify({
-            "error":
-                str(error)
+            "status": "error",
+            "error": str(e)
         }), 500
 
 
 if __name__ == "__main__":
-
     app.run(
         host="0.0.0.0",
         port=5000,
-        debug=True
+        debug=False
     )
