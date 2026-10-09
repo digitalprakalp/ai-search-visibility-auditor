@@ -67,6 +67,12 @@ def fetch_page(url):
 def extract_page_data(url, html):
     soup = BeautifulSoup(html, "html.parser")
 
+    raw_jsonld_count = len(re.findall(
+    r'<script\b[^>]*type=["\']application/ld\+json["\']',
+    html,
+    flags=re.IGNORECASE
+))
+
     # Remove elements that don't represent main readable content
     for element in soup([
         "script",
@@ -255,6 +261,7 @@ questions = unique_questions
         "schemas": schemas,
         "schema_types": schema_types,
         "schema_errors": schema_errors,
+        "raw_jsonld_count": raw_jsonld_count,
 
 
         "images": images,
@@ -458,7 +465,13 @@ def audit():
                 "pages_analyzed": len(pages),
                 "total_words": total_words,
                 "total_questions": total_questions,
-                "total_schemas": total_schemas
+                
+"total_schemas": total_schemas,
+"raw_jsonld_blocks": sum(
+    page.get("raw_jsonld_count", 0)
+    for page in pages
+)
+
             },
 
             "crawl": {
