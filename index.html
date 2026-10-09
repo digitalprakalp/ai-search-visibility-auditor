@@ -424,8 +424,11 @@ document
     result.website.total_words +
     "\nQuestions found: " +
     result.website.total_questions +
-    "\nStructured data blocks: " +
+   
+"\nStructured data blocks: " +
 result.website.total_schemas +
+"\nRaw JSON-LD blocks: " +
+(result.website.raw_jsonld_blocks ?? "Not returned") +
 "\nSchema types: " +
 [...new Set(result.crawl.pages.flatMap(
     page => page.schema_types || []
