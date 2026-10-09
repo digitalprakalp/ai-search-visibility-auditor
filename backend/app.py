@@ -128,21 +128,23 @@ def extract_page_data(url, html):
         if len(question) > 15 and len(question) < 300:
             questions.append(question)
 
-   # Remove duplicate questions after normalizing whitespace,
-# numbering and capitalization.
-unique_questions = []
-seen_questions = set()
+  
+    # Remove duplicate questions after normalizing whitespace,
+    # numbering and capitalization.
+    unique_questions = []
+    seen_questions = set()
 
-for question in questions:
-    normalized = re.sub(r"\s+", " ", question).strip()
-    normalized = re.sub(r"^[\d\s.]+", "", normalized)
-    normalized = normalized.casefold().rstrip(" .")
+    for question in questions:
+        normalized = re.sub(r"\s+", " ", question).strip()
+        normalized = re.sub(r"^[\d\s.]+", "", normalized)
+        normalized = normalized.casefold().rstrip(" .")
 
-    if normalized and normalized not in seen_questions:
-        seen_questions.add(normalized)
-        unique_questions.append(question.strip())
+        if normalized and normalized not in seen_questions:
+            seen_questions.add(normalized)
+            unique_questions.append(question.strip())
 
-questions = unique_questions
+    questions = unique_questions
+
     # Links
     links = []
 
