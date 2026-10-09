@@ -169,8 +169,56 @@ questions = unique_questions
     if canonical_tag:
         canonical = canonical_tag.get("href")
 
-    # Structured data
+    
+    # Structured data: extract and validate JSON-LD
+    import json
+
     schemas = []
+    schema_types = []
+    schema_errors = []
+
+    for script in soup.find_all(
+        "script",
+        attrs={"type": re.compile(r"application/ld\+json", re.I)}
+    ):
+        schema_text = script.get_text(strip=True)
+
+        if not schema_text:
+            continue
+
+        try:
+            schema_data = json.loads(schema_text)
+            schemas.append(schema_data)
+
+            def collect_schema_types(item):
+                if isinstance(item, dict):
+                    item_type = item.get("@type")
+
+                    if isinstance(item_type, str):
+                        schema_types.append(item_type)
+                    elif isinstance(item_type, list):
+                        schema_types.extend(
+                            value for value in item_type
+                            if isinstance(value, str)
+                        )
+
+                    graph = item.get("@graph")
+
+                    if isinstance(graph, list):
+                        for entry in graph:
+                            collect_schema_types(entry)
+
+                elif isinstance(item, list):
+                    for entry in item:
+                        collect_schema_types(entry)
+
+            collect_schema_types(schema_data)
+
+        except (json.JSONDecodeError, TypeError):
+            schema_errors.append("Invalid JSON-LD block")
+
+    schema_types = sorted(set(schema_types))
+
 
     for script in soup.find_all(
         "script",
@@ -211,7 +259,11 @@ questions = unique_questions
 
         "canonical": canonical,
 
+        
         "schemas": schemas,
+        "schema_types": schema_types,
+        "schema_errors": schema_errors,
+
 
         "images": images,
         "images_without_alt": images_without_alt,
