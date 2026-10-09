@@ -425,7 +425,12 @@ document
     "\nQuestions found: " +
     result.website.total_questions +
     "\nStructured data blocks: " +
-    result.website.total_schemas +
+result.website.total_schemas +
+"\nSchema types: " +
+[...new Set(result.crawl.pages.flatMap(
+    page => page.schema_types || []
+))].join(", ") +
+
     "\n\nRobots.txt: " +
     (result.technical.robots_txt.available ? "Found" : "Not found") +
     "\nSitemap.xml: " +
