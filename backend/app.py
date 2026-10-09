@@ -219,15 +219,7 @@ questions = unique_questions
 
     schema_types = sorted(set(schema_types))
 
-
-    for script in soup.find_all(
-        "script",
-        attrs={"type": "application/ld+json"}
-    ):
-        if script.string:
-            schemas.append(script.string.strip())
-
-    # Images
+      # Images
     images = len(soup.find_all("img"))
 
     images_without_alt = len([
