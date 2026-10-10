@@ -278,6 +278,37 @@
 
         </form>
 
+<div id="auditResults" style="display:none; max-width:900px; margin:35px auto 0; text-align:left; background:#0e1a2a; border:1px solid #26374c; border-radius:15px; padding:28px;">
+    <h2 style="color:#63e6be; margin-bottom:10px;">Your Website Audit</h2>
+    <p id="auditStatus" style="color:#aeb9c8; margin-bottom:22px;">Audit completed successfully.</p>
+
+    <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:14px;">
+        <div style="background:#101d2e; padding:18px; border-radius:10px;">
+            <p style="color:#8e9bad; font-size:13px;">Pages Analyzed</p>
+            <h3 id="pagesAnalyzed">—</h3>
+        </div>
+        <div style="background:#101d2e; padding:18px; border-radius:10px;">
+            <p style="color:#8e9bad; font-size:13px;">Total Words</p>
+            <h3 id="totalWords">—</h3>
+        </div>
+        <div style="background:#101d2e; padding:18px; border-radius:10px;">
+            <p style="color:#8e9bad; font-size:13px;">Questions Found</p>
+            <h3 id="totalQuestions">—</h3>
+        </div>
+        <div style="background:#101d2e; padding:18px; border-radius:10px;">
+            <p style="color:#8e9bad; font-size:13px;">Structured Data Blocks</p>
+            <h3 id="totalSchemas">—</h3>
+        </div>
+    </div>
+
+    <h3 style="margin:25px 0 12px;">Technical Accessibility</h3>
+    <div id="technicalResults" style="color:#c5d0dd; line-height:2;"></div>
+
+    <p style="color:#8e9bad; font-size:12px; margin-top:20px;">
+        These are crawl diagnostics, not AI visibility measurements or a readiness score.
+    </p>
+</div>
+       
     </div>
 
 </section>
